@@ -107,18 +107,19 @@ def split_pdf_page(pdf_bytes: bytes, page_index: int) -> bytes:
 
 def detect_visual_pages(pdf_bytes: bytes) -> list[bool]:
     """
-    각 페이지에 그림/도형/이미지가 있는지 pdfplumber로 로컬에서(무료·빠름) 판별한다.
-    삽입 이미지, 사각형, 선, 곡선 중 하나라도 있으면 시각 요소가 있는 것으로 본다
-    (보수적 판별 — 100% 순수 텍스트 페이지만 걸러낸다). 반환값은 페이지별 True/False.
+    각 페이지에 그림/도표가 있는지 pdfplumber로 로컬에서(무료·빠름) 판별한다.
+    삽입 이미지 또는 곡선(curve)이 있는 페이지만 시각 요소가 있는 것으로 본다
+    (스마트 판별): 표는 대개 직선·사각형으로만 그려지므로, 곡선이 있는 페이지는
+    화살표·둥근 박스 등을 가진 진짜 도표(플로우차트 등)일 가능성이 높다. 순수
+    텍스트 페이지와 일반 표 페이지를 함께 걸러내 표 많은 문서에서 특히 빠르다.
+    (단, 직선·사각형만으로 그린 단순 도표는 놓칠 수 있음.) 반환값은 페이지별 T/F.
     """
     import pdfplumber
 
     flags: list[bool] = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
-            has_visual = bool(
-                page.images or page.rects or page.lines or page.curves
-            )
+            has_visual = bool(page.images or page.curves)
             flags.append(has_visual)
     return flags
 
@@ -243,8 +244,9 @@ with st.sidebar:
         )
         st.caption("손글씨나 스캔 이미지처럼 텍스트 추출이 어려운 파일을 위 모델로 해석합니다.")
         st.caption(
-            "📄 PDF는 그림/도표가 있는 페이지만 골라 해석하고, 그 결과를 해당 "
-            "페이지 바로 뒤에 넣습니다. 그림이 많은 문서는 시간이 더 걸릴 수 있습니다."
+            "📄 PDF는 이미지나 도표(플로우차트 등)가 있는 페이지만 골라 해석하고, "
+            "그 결과를 해당 페이지 바로 뒤에 넣습니다. 일반 표·텍스트 페이지는 건너뛰어 "
+            "빠릅니다. 도표가 많은 문서는 시간이 더 걸릴 수 있습니다."
         )
 
     st.divider()
