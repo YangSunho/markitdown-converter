@@ -1,8 +1,10 @@
+import base64
 import io
 import os
 import re
 import zipfile
 
+import requests
 import streamlit as st
 from markitdown import MarkItDown
 
@@ -49,6 +51,48 @@ def describe_embedded_images(markdown_text: str, client, model: str) -> str:
         return f"\n\n> 🖼️ **[이미지 해석]** {caption}\n\n"
 
     return IMG_DATA_URI_RE.sub(_replace, markdown_text)
+
+
+# MarkItDown의 PdfConverter는 pdfplumber/pdfminer로 텍스트·표만 추출하고,
+# 문서 안의 이미지/차트/도표는 아예 마크다운에 남기지 않는다(추출 자체를
+# 안 함). 그래서 describe_embedded_images()로는 PDF 안 이미지를 찾을 수
+# 없다 — PDF 원본 파일 전체를 Gemini의 네이티브 문서이해 API로 직접 보내
+# "이 안에 이미지/도표가 있으면 설명해줘"라고 따로 요청해야 한다. (Gemini의
+# OpenAI 호환 엔드포인트는 이미지만 지원하고 PDF 문서 입력은 지원하지 않아
+# 네이티브 REST 엔드포인트를 그대로 사용한다.)
+GEMINI_NATIVE_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+
+def describe_pdf_visuals(pdf_bytes: bytes, api_key: str, model: str) -> str:
+    b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"inline_data": {"mime_type": "application/pdf", "data": b64}},
+                    {
+                        "text": (
+                            "이 PDF 문서 안에서 텍스트가 아니라 이미지, 차트, 도표, "
+                            "플로우차트 등 시각 자료로 들어가 있는 내용을 찾아서, 각각 "
+                            "무엇을 나타내는지 한국어로 상세히 설명해줘. 표나 텍스트가 "
+                            "이미지 안에 있으면 최대한 그대로 옮겨써줘. 문서 안에 별도의 "
+                            "이미지/도표가 전혀 없다면 '문서 내 별도의 이미지/도표 없음'이라고만 답해줘."
+                        )
+                    },
+                ]
+            }
+        ]
+    }
+    resp = requests.post(
+        GEMINI_NATIVE_URL.format(model=model),
+        params={"key": api_key},
+        json=payload,
+        timeout=120,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["candidates"][0]["content"]["parts"][0]["text"]
+
 
 st.set_page_config(page_title="MarkItDown 변환기", page_icon="📄", layout="centered")
 
@@ -185,6 +229,16 @@ if convert_clicked:
                     markdown_text = describe_embedded_images(
                         markdown_text, llm_client_obj, llm_model
                     )
+                    if ext.lower() == ".pdf":
+                        try:
+                            visuals = describe_pdf_visuals(
+                                uf.getvalue(), api_key, llm_model
+                            )
+                            markdown_text += (
+                                f"\n\n---\n\n## 🖼️ 이미지/도표 해석 (Gemini)\n\n{visuals}\n"
+                            )
+                        except Exception as e:
+                            markdown_text += f"\n\n> (PDF 이미지 해석 실패: {e})\n"
                 results[uf.name] = markdown_text
             except Exception as e:
                 st.error(f"'{uf.name}' 변환 실패: {e}")
