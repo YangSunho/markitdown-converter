@@ -3,3 +3,8 @@ __pycache__/
 .ipynb_checkpoints/
 .streamlit/secrets.toml
 .claude/
+
+# 로컬 전용 도구/문서 — 배포된 웹앱(streamlit_app.py)에는 불필요, GitHub에는 올리지 않음
+DESIGN.md
+MarkitDown-Yang.ipynb
+app.py
