@@ -1,3 +1,3 @@
 streamlit
-markitdown[all]==0.1.6
+markitdown[pdf,docx,pptx,xls,xlsx,outlook,audio-transcription]==0.1.6
 openai
