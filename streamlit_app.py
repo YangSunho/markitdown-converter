@@ -105,6 +105,24 @@ def split_pdf_page(pdf_bytes: bytes, page_index: int) -> bytes:
     return buf.getvalue()
 
 
+def detect_visual_pages(pdf_bytes: bytes) -> list[bool]:
+    """
+    각 페이지에 그림/도형/이미지가 있는지 pdfplumber로 로컬에서(무료·빠름) 판별한다.
+    삽입 이미지, 사각형, 선, 곡선 중 하나라도 있으면 시각 요소가 있는 것으로 본다
+    (보수적 판별 — 100% 순수 텍스트 페이지만 걸러낸다). 반환값은 페이지별 True/False.
+    """
+    import pdfplumber
+
+    flags: list[bool] = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            has_visual = bool(
+                page.images or page.rects or page.lines or page.curves
+            )
+            flags.append(has_visual)
+    return flags
+
+
 def convert_pdf_with_inline_visuals(
     pdf_bytes: bytes, md: MarkItDown, api_key: str, model: str
 ) -> str:
@@ -112,9 +130,14 @@ def convert_pdf_with_inline_visuals(
     PDF를 페이지 단위로 쪼개서 각 페이지를 개별 변환하고, 그 페이지의 이미지/도표
     해석(있는 경우)을 페이지 텍스트 바로 뒤에 붙인다. 문서 전체를 한 번에 보내는
     방식과 달리, 이미지 해석이 문서 맨 끝으로 밀리지 않고 원래 위치 근처에 남는다.
+
+    속도 최적화: 그림/도형이 있는 페이지만 Gemini에 보내고, 순수 텍스트 페이지는
+    호출과 대기를 모두 건너뛴다.
     """
-    num_pages = len(pdfium.PdfDocument(pdf_bytes))
+    visual_flags = detect_visual_pages(pdf_bytes)
+    num_pages = len(visual_flags)
     page_sections = []
+    called_gemini_once = False
     for page_idx in range(num_pages):
         single_page_bytes = split_pdf_page(pdf_bytes, page_idx)
 
@@ -123,19 +146,24 @@ def convert_pdf_with_inline_visuals(
         )
         section = page_result.markdown.strip()
 
-        try:
-            visual = describe_pdf_visuals(single_page_bytes, api_key, model).strip()
-        except Exception as e:
-            visual = f"(페이지 {page_idx + 1} 이미지 해석 실패: {e})"
+        if visual_flags[page_idx]:
+            # Gemini 무료 등급 분당 요청 한도(RPM)를 넘기지 않도록 실제 호출
+            # 사이에만 잠깐 대기 (텍스트 전용 페이지는 대기 없이 넘어간다).
+            if called_gemini_once:
+                time.sleep(4)
+            called_gemini_once = True
 
-        if visual and visual != "NONE":
-            section += f"\n\n> 🖼️ **[페이지 {page_idx + 1} 이미지/도표 해석]** {visual}"
+            try:
+                visual = describe_pdf_visuals(single_page_bytes, api_key, model).strip()
+            except Exception as e:
+                visual = f"(페이지 {page_idx + 1} 이미지 해석 실패: {e})"
+
+            if visual and visual != "NONE":
+                section += (
+                    f"\n\n> 🖼️ **[페이지 {page_idx + 1} 이미지/도표 해석]** {visual}"
+                )
 
         page_sections.append(section)
-
-        # Gemini 무료 등급 분당 요청 한도(RPM)를 넘기지 않도록 페이지마다 약간 대기
-        if page_idx < num_pages - 1:
-            time.sleep(4)
 
     return "\n\n".join(s for s in page_sections if s)
 
@@ -215,8 +243,8 @@ with st.sidebar:
         )
         st.caption("손글씨나 스캔 이미지처럼 텍스트 추출이 어려운 파일을 위 모델로 해석합니다.")
         st.caption(
-            "📄 PDF는 이미지/도표 해석 결과를 해당 페이지 바로 뒤에 넣기 위해 "
-            "페이지마다 따로 분석합니다 — 페이지 수가 많으면 시간이 더 걸릴 수 있습니다."
+            "📄 PDF는 그림/도표가 있는 페이지만 골라 해석하고, 그 결과를 해당 "
+            "페이지 바로 뒤에 넣습니다. 그림이 많은 문서는 시간이 더 걸릴 수 있습니다."
         )
 
     st.divider()
