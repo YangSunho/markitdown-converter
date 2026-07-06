@@ -2,8 +2,10 @@ import base64
 import io
 import os
 import re
+import time
 import zipfile
 
+import pypdfium2 as pdfium
 import requests
 import streamlit as st
 from markitdown import MarkItDown
@@ -72,11 +74,11 @@ def describe_pdf_visuals(pdf_bytes: bytes, api_key: str, model: str) -> str:
                     {"inline_data": {"mime_type": "application/pdf", "data": b64}},
                     {
                         "text": (
-                            "이 PDF 문서 안에서 텍스트가 아니라 이미지, 차트, 도표, "
-                            "플로우차트 등 시각 자료로 들어가 있는 내용을 찾아서, 각각 "
-                            "무엇을 나타내는지 한국어로 상세히 설명해줘. 표나 텍스트가 "
-                            "이미지 안에 있으면 최대한 그대로 옮겨써줘. 문서 안에 별도의 "
-                            "이미지/도표가 전혀 없다면 '문서 내 별도의 이미지/도표 없음'이라고만 답해줘."
+                            "이 PDF 문서(또는 페이지) 안에서 텍스트가 아니라 이미지, 차트, "
+                            "도표, 플로우차트 등 시각 자료로 들어가 있는 내용을 찾아서, 각각 "
+                            "무엇을 나타내는지 한국어로 상세히 설명해줘. 표나 텍스트가 이미지 "
+                            "안에 있으면 최대한 그대로 옮겨써줘. 텍스트가 아닌 별도의 이미지/"
+                            "도표가 전혀 없다면, 다른 말 없이 정확히 NONE 이라고만 답해줘."
                         )
                     },
                 ]
@@ -92,6 +94,50 @@ def describe_pdf_visuals(pdf_bytes: bytes, api_key: str, model: str) -> str:
     resp.raise_for_status()
     data = resp.json()
     return data["candidates"][0]["content"]["parts"][0]["text"]
+
+
+def split_pdf_page(pdf_bytes: bytes, page_index: int) -> bytes:
+    src_doc = pdfium.PdfDocument(pdf_bytes)
+    single_doc = pdfium.PdfDocument.new()
+    single_doc.import_pages(src_doc, pages=[page_index])
+    buf = io.BytesIO()
+    single_doc.save(buf)
+    return buf.getvalue()
+
+
+def convert_pdf_with_inline_visuals(
+    pdf_bytes: bytes, md: MarkItDown, api_key: str, model: str
+) -> str:
+    """
+    PDF를 페이지 단위로 쪼개서 각 페이지를 개별 변환하고, 그 페이지의 이미지/도표
+    해석(있는 경우)을 페이지 텍스트 바로 뒤에 붙인다. 문서 전체를 한 번에 보내는
+    방식과 달리, 이미지 해석이 문서 맨 끝으로 밀리지 않고 원래 위치 근처에 남는다.
+    """
+    num_pages = len(pdfium.PdfDocument(pdf_bytes))
+    page_sections = []
+    for page_idx in range(num_pages):
+        single_page_bytes = split_pdf_page(pdf_bytes, page_idx)
+
+        page_result = md.convert_stream(
+            io.BytesIO(single_page_bytes), file_extension=".pdf"
+        )
+        section = page_result.markdown.strip()
+
+        try:
+            visual = describe_pdf_visuals(single_page_bytes, api_key, model).strip()
+        except Exception as e:
+            visual = f"(페이지 {page_idx + 1} 이미지 해석 실패: {e})"
+
+        if visual and visual != "NONE":
+            section += f"\n\n> 🖼️ **[페이지 {page_idx + 1} 이미지/도표 해석]** {visual}"
+
+        page_sections.append(section)
+
+        # Gemini 무료 등급 분당 요청 한도(RPM)를 넘기지 않도록 페이지마다 약간 대기
+        if page_idx < num_pages - 1:
+            time.sleep(4)
+
+    return "\n\n".join(s for s in page_sections if s)
 
 
 st.set_page_config(page_title="MarkItDown 변환기", page_icon="📄", layout="centered")
@@ -168,6 +214,10 @@ with st.sidebar:
             "바꿔서 시도해보세요. Google이 모델을 새로 내놓으면 여기에 최신 모델명을 넣으면 됩니다.",
         )
         st.caption("손글씨나 스캔 이미지처럼 텍스트 추출이 어려운 파일을 위 모델로 해석합니다.")
+        st.caption(
+            "📄 PDF는 이미지/도표 해석 결과를 해당 페이지 바로 뒤에 넣기 위해 "
+            "페이지마다 따로 분석합니다 — 페이지 수가 많으면 시간이 더 걸릴 수 있습니다."
+        )
 
     st.divider()
     with st.expander("ℹ️ 앱 정보"):
@@ -218,27 +268,23 @@ if convert_clicked:
         for i, uf in enumerate(uploaded_files):
             try:
                 ext = os.path.splitext(uf.name)[1]
-                stream = io.BytesIO(uf.getvalue())
-                # keep_data_uris: LLM으로 이미지를 해석하려면 문서에 박힌 이미지의
-                # 실제 base64 데이터가 markdown에 남아있어야 한다 (기본값은 잘림).
-                result = md.convert_stream(
-                    stream, file_extension=ext, keep_data_uris=use_llm
-                )
-                markdown_text = result.markdown
-                if llm_client_obj is not None:
-                    markdown_text = describe_embedded_images(
-                        markdown_text, llm_client_obj, llm_model
+
+                if ext.lower() == ".pdf" and llm_client_obj is not None:
+                    markdown_text = convert_pdf_with_inline_visuals(
+                        uf.getvalue(), md, api_key, llm_model
                     )
-                    if ext.lower() == ".pdf":
-                        try:
-                            visuals = describe_pdf_visuals(
-                                uf.getvalue(), api_key, llm_model
-                            )
-                            markdown_text += (
-                                f"\n\n---\n\n## 🖼️ 이미지/도표 해석 (Gemini)\n\n{visuals}\n"
-                            )
-                        except Exception as e:
-                            markdown_text += f"\n\n> (PDF 이미지 해석 실패: {e})\n"
+                else:
+                    stream = io.BytesIO(uf.getvalue())
+                    # keep_data_uris: LLM으로 이미지를 해석하려면 문서에 박힌 이미지의
+                    # 실제 base64 데이터가 markdown에 남아있어야 한다 (기본값은 잘림).
+                    result = md.convert_stream(
+                        stream, file_extension=ext, keep_data_uris=use_llm
+                    )
+                    markdown_text = result.markdown
+                    if llm_client_obj is not None:
+                        markdown_text = describe_embedded_images(
+                            markdown_text, llm_client_obj, llm_model
+                        )
                 results[uf.name] = markdown_text
             except Exception as e:
                 st.error(f"'{uf.name}' 변환 실패: {e}")
